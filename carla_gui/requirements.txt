@@ -1,0 +1,2 @@
+PyQt5>=5.15.0
+# carla  # Install separately: pip install carla==0.9.16 (or the .whl from CARLA releases)
