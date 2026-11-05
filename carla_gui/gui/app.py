@@ -18,6 +18,7 @@ from gui.map_view import MapScene, MapView, START_COLOR, END_COLOR, PED_COLOR, N
 from gui.scenario_panel import ScenarioPanel
 from gui.sensor_placer import SensorPlacerWidget, SENSOR_TYPES
 from gui.sensor_window import SensorFeedWindow, SensorManager
+from gui.hud_window import HudWindow, METRIC_REGISTRY
 from scenarios.pedestrian_crossing import ScenarioRunner
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ class CarlaGuiApp(QMainWindow):
         self._run_elapsed = 0
         self._sensor_manager: SensorManager = None
         self._sensor_feed_window: SensorFeedWindow = None
+        self._hud_window: HudWindow = None
 
         # Map scene (created early so scenario panel can reference it)
         self._map_scene = MapScene()
@@ -96,6 +98,7 @@ class CarlaGuiApp(QMainWindow):
         tabs.addTab(self._build_weather_tab(), "🌦 Weather")
         tabs.addTab(self._build_scenarios_full_tab(), "🎭 Scenarios")
         tabs.addTab(self._build_sensors_tab(), "📷 Sensors")
+        tabs.addTab(self._build_hud_tab(), "📊 HUD")
         tabs.addTab(self._build_terminal_tab(), "🖥 Terminal")
 
     # ── Connection ───────────────────────────────────────────────────────────
@@ -481,6 +484,80 @@ class CarlaGuiApp(QMainWindow):
         if self._sensor_feed_window and self._sensor_manager:
             self._sensor_feed_window.close_all(self._sensor_manager)
         self._append_log("[OK] All sensors detached.")
+
+    # ── HUD ──────────────────────────────────────────────────────────────────
+    def _build_hud_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        note = QLabel(
+            "Add any vehicle dynamics metric below. Each panel shows the live value "
+            "and a sparkline chart.\nColour: green = normal  |  yellow = warning  |  red = critical.\n"
+            "Click '▶ Open HUD Window' to pop it out as a separate floating window.\n"
+            "Configured metrics are saved into exported Python scripts — run the .py standalone "
+            "and all HUD windows open automatically."
+        )
+        note.setWordWrap(True)
+        v.addWidget(note)
+
+        # Quick-add row
+        add_row = QHBoxLayout()
+        add_row.addWidget(QLabel("Add metric:"))
+        self._hud_metric_combo = QComboBox()
+        self._hud_metric_combo.addItems(sorted(METRIC_REGISTRY.keys()))
+        self._hud_metric_combo.setMinimumWidth(220)
+        add_row.addWidget(self._hud_metric_combo)
+        add_btn = QPushButton("+ Add")
+        add_btn.clicked.connect(self._hud_add_metric)
+        add_row.addWidget(add_btn)
+
+        # Quick presets
+        preset_btn = QPushButton("Add driving basics")
+        preset_btn.clicked.connect(lambda: self._hud_add_preset([
+            "Speed (km/h)", "TTC", "Throttle", "Brake", "Steer",
+            "Location X", "Location Y", "Heading (yaw)",
+        ]))
+        add_row.addWidget(preset_btn)
+        add_row.addStretch()
+        v.addLayout(add_row)
+
+        # Inline HUD (embedded, same as floating but inside tab)
+        self._hud_inline = HudWindow(carla_client=self._carla)
+        self._hud_inline.setWindowFlags(Qt.Widget)   # embed as widget
+        v.addWidget(self._hud_inline, stretch=1)
+
+        # Open floating window button
+        float_btn = QPushButton("▶ Open as Floating Window")
+        float_btn.setFixedHeight(32)
+        float_btn.setStyleSheet("background:#2980b9;color:white;font-weight:bold;")
+        float_btn.clicked.connect(self._open_hud_float)
+        v.addWidget(float_btn)
+        return w
+
+    def _hud_add_metric(self):
+        name = self._hud_metric_combo.currentText()
+        self._hud_inline._add_metric(name)
+        self._scenario_panel.update_config(
+            "hud_metrics",
+            [p for p in self._hud_inline._panels.keys()]
+        )
+
+    def _hud_add_preset(self, names):
+        for n in names:
+            self._hud_inline._add_metric(n)
+        self._scenario_panel.update_config(
+            "hud_metrics",
+            list(self._hud_inline._panels.keys())
+        )
+
+    def _open_hud_float(self):
+        if self._hud_window is None:
+            self._hud_window = HudWindow(carla_client=self._carla)
+        # Sync metrics from inline panel
+        for name in self._hud_inline._panels.keys():
+            self._hud_window._add_metric(name)
+        self._hud_window.show()
+        self._hud_window.raise_()
 
     # ── Terminal ─────────────────────────────────────────────────────────────
     def _build_terminal_tab(self):
