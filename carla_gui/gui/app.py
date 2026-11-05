@@ -7,50 +7,61 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
     QGroupBox, QSlider, QTextEdit, QSplitter, QGridLayout, QSpinBox,
-    QProgressBar, QListWidget, QMessageBox, QFrame,
+    QDoubleSpinBox, QListWidget, QMessageBox, QProgressBar,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QColor, QPalette, QTextCursor
+from PyQt5.QtGui import QFont, QColor, QTextCursor
 
 from carla_client.client import CarlaClient, scan_ports
-from scenarios.pedestrian_crossing import ScenarioRunner, SCENARIO_LIST
+from carla_client.route_planner import RoutePlanner
+from gui.map_view import MapScene, MapView, START_COLOR, END_COLOR, PED_COLOR, NPC_COLOR
+from gui.scenario_panel import ScenarioPanel
+from scenarios.pedestrian_crossing import ScenarioRunner
 
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Signal bridge — emit from any thread, receive on Qt main thread
-# ─────────────────────────────────────────────────────────────────────────────
 class _Bridge(QObject):
     log_signal = pyqtSignal(str)
     blueprints_signal = pyqtSignal(list)
     weather_signal = pyqtSignal(list)
-    status_signal = pyqtSignal(bool)   # connected T/F
+    status_signal = pyqtSignal(bool)
+    map_loaded_signal = pyqtSignal(list, list)   # segments, spawn_transforms
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main window
-# ─────────────────────────────────────────────────────────────────────────────
 class CarlaGuiApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CARLA 0.9.16 — Control Panel")
-        self.setMinimumSize(900, 680)
+        self.setMinimumSize(1050, 740)
 
         self._bridge = _Bridge()
         self._bridge.log_signal.connect(self._append_log)
         self._bridge.blueprints_signal.connect(self._populate_blueprints)
         self._bridge.weather_signal.connect(self._populate_weather)
         self._bridge.status_signal.connect(self._on_connection_changed)
+        self._bridge.map_loaded_signal.connect(self._draw_map)
 
         self._carla = CarlaClient(on_log=lambda m: self._bridge.log_signal.emit(m))
-        self._scenario_runner = None
+        self._route_planner = None
+        self._spawn_transforms = []     # list of carla.Transform
+        self._route_start = None        # carla.Transform
+        self._route_end = None
+        self._last_map_click = None     # (x, y, z)
+        self._placement_mode = None
+        self._run_timer = None
+        self._run_elapsed = 0
+
+        # Map scene (created early so scenario panel can reference it)
+        self._map_scene = MapScene()
+        self._map_scene.spawn_clicked.connect(self._on_spawn_clicked)
+        self._map_scene.waypoint_clicked.connect(self._on_waypoint_clicked)
 
         self._build_ui()
         self._set_connected(False)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # UI construction
+    # UI
     # ─────────────────────────────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
@@ -58,7 +69,7 @@ class CarlaGuiApp(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
 
-        # ── status bar (top) ──────────────────────────────────────────────
+        # Status bar
         status_row = QHBoxLayout()
         self._status_dot = QLabel("●")
         self._status_dot.setFixedWidth(18)
@@ -71,47 +82,41 @@ class CarlaGuiApp(QMainWindow):
         status_row.addWidget(self._map_label)
         root.addLayout(status_row)
 
-        # ── tabs ─────────────────────────────────────────────────────────
         tabs = QTabWidget()
         root.addWidget(tabs, stretch=1)
 
         tabs.addTab(self._build_connection_tab(), "🔌 Connection")
         tabs.addTab(self._build_vehicle_tab(), "🚗 Vehicle")
+        tabs.addTab(self._build_map_tab(), "🗺 Map & Route")
         tabs.addTab(self._build_controls_tab(), "🎮 Controls")
         tabs.addTab(self._build_weather_tab(), "🌦 Weather")
-        tabs.addTab(self._build_scenarios_tab(), "🗺 Scenarios")
+        tabs.addTab(self._build_scenarios_full_tab(), "🎭 Scenarios")
         tabs.addTab(self._build_terminal_tab(), "🖥 Terminal")
 
-    # ── Connection tab ───────────────────────────────────────────────────────
+    # ── Connection ───────────────────────────────────────────────────────────
     def _build_connection_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
 
         grp = QGroupBox("Server")
         grid = QGridLayout(grp)
-
         grid.addWidget(QLabel("Host:"), 0, 0)
         self._host_edit = QLineEdit("localhost")
         grid.addWidget(self._host_edit, 0, 1)
-
         grid.addWidget(QLabel("Port:"), 0, 2)
         self._port_spin = QSpinBox()
         self._port_spin.setRange(1024, 65535)
         self._port_spin.setValue(2000)
         grid.addWidget(self._port_spin, 0, 3)
-
         self._scan_btn = QPushButton("Scan ports")
         self._scan_btn.clicked.connect(self._scan_ports)
         grid.addWidget(self._scan_btn, 0, 4)
-
-        grid.addWidget(QLabel("Available ports:"), 1, 0)
+        grid.addWidget(QLabel("Available:"), 1, 0)
         self._port_list = QListWidget()
-        self._port_list.setMaximumHeight(80)
+        self._port_list.setMaximumHeight(70)
         self._port_list.itemClicked.connect(
-            lambda item: self._port_spin.setValue(int(item.text()))
-        )
+            lambda item: self._port_spin.setValue(int(item.text())))
         grid.addWidget(self._port_list, 1, 1, 1, 4)
-
         v.addWidget(grp)
 
         btn_row = QHBoxLayout()
@@ -125,18 +130,14 @@ class CarlaGuiApp(QMainWindow):
         btn_row.addWidget(self._disconnect_btn)
         v.addLayout(btn_row)
 
-        # Server info
         info_grp = QGroupBox("Server Info")
-        info_grid = QGridLayout(info_grp)
+        ig = QGridLayout(info_grp)
         self._info_map = QLabel("—")
         self._info_loc = QLabel("—")
-        info_grid.addWidget(QLabel("Map:"), 0, 0)
-        info_grid.addWidget(self._info_map, 0, 1)
-        info_grid.addWidget(QLabel("Spectator:"), 1, 0)
-        info_grid.addWidget(self._info_loc, 1, 1)
+        ig.addWidget(QLabel("Map:"), 0, 0); ig.addWidget(self._info_map, 0, 1)
+        ig.addWidget(QLabel("Spectator:"), 1, 0); ig.addWidget(self._info_loc, 1, 1)
         v.addWidget(info_grp)
 
-        # Refresh timer
         self._info_timer = QTimer()
         self._info_timer.timeout.connect(self._refresh_info)
         self._info_timer.start(2000)
@@ -144,38 +145,35 @@ class CarlaGuiApp(QMainWindow):
         v.addStretch()
         return w
 
-    # ── Vehicle tab ──────────────────────────────────────────────────────────
+    # ── Vehicle ──────────────────────────────────────────────────────────────
     def _build_vehicle_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
 
-        # Blueprint selection
         bp_grp = QGroupBox("Blueprint")
-        bp_layout = QHBoxLayout(bp_grp)
-        bp_layout.addWidget(QLabel("Vehicle:"))
+        bph = QHBoxLayout(bp_grp)
+        bph.addWidget(QLabel("Vehicle:"))
         self._bp_combo = QComboBox()
         self._bp_combo.setMinimumWidth(300)
-        bp_layout.addWidget(self._bp_combo, stretch=1)
-        self._refresh_bp_btn = QPushButton("↻")
-        self._refresh_bp_btn.setFixedWidth(32)
-        self._refresh_bp_btn.clicked.connect(self._load_blueprints)
-        bp_layout.addWidget(self._refresh_bp_btn)
+        bph.addWidget(self._bp_combo, stretch=1)
+        ref_btn = QPushButton("↻")
+        ref_btn.setFixedWidth(32)
+        ref_btn.clicked.connect(self._load_blueprints)
+        bph.addWidget(ref_btn)
         v.addWidget(bp_grp)
 
-        # Autopilot
         ap_grp = QGroupBox("Autopilot")
-        ap_layout = QHBoxLayout(ap_grp)
-        self._autopilot_check = QCheckBox("Enable autopilot on spawn")
-        ap_layout.addWidget(self._autopilot_check)
+        aph = QHBoxLayout(ap_grp)
+        self._autopilot_check = QCheckBox("Enable on spawn")
+        aph.addWidget(self._autopilot_check)
         self._ap_toggle_btn = QPushButton("Toggle Autopilot (P)")
         self._ap_toggle_btn.clicked.connect(self._toggle_autopilot)
-        ap_layout.addWidget(self._ap_toggle_btn)
+        aph.addWidget(self._ap_toggle_btn)
         self._autopilot_state = False
         v.addWidget(ap_grp)
 
-        # Spawn / Destroy
         spawn_row = QHBoxLayout()
-        self._spawn_btn = QPushButton("Spawn Vehicle")
+        self._spawn_btn = QPushButton("Spawn at selected map point")
         self._spawn_btn.setFixedHeight(36)
         self._spawn_btn.clicked.connect(self._spawn_vehicle)
         self._destroy_btn = QPushButton("Destroy Vehicle")
@@ -185,50 +183,118 @@ class CarlaGuiApp(QMainWindow):
         spawn_row.addWidget(self._destroy_btn)
         v.addLayout(spawn_row)
 
-        # Lights
+        self._spawn_location_lbl = QLabel("Spawn: random (click map to set)")
+        v.addWidget(self._spawn_location_lbl)
+
         lights_grp = QGroupBox("Lights")
-        lights_layout = QHBoxLayout(lights_grp)
-        lights_layout.addWidget(QLabel("Light state:"))
+        lh = QHBoxLayout(lights_grp)
+        lh.addWidget(QLabel("State:"))
         self._lights_combo = QComboBox()
         self._lights_combo.addItems([
             "Off", "Position", "Low Beam", "High Beam", "Fog",
             "Interior", "Left Blinker", "Right Blinker", "All",
         ])
         self._lights_combo.currentTextChanged.connect(
-            lambda t: threading.Thread(target=self._carla.set_light_state, args=(t,), daemon=True).start()
-        )
-        lights_layout.addWidget(self._lights_combo)
+            lambda t: threading.Thread(target=self._carla.set_light_state, args=(t,), daemon=True).start())
+        lh.addWidget(self._lights_combo)
         v.addWidget(lights_grp)
 
-        # Doors
         doors_grp = QGroupBox("Doors")
-        doors_layout = QHBoxLayout(doors_grp)
-        open_btn = QPushButton("Open All (O)")
-        open_btn.clicked.connect(lambda: threading.Thread(
-            target=self._carla.open_doors, args=(True,), daemon=True).start())
-        close_btn = QPushButton("Close All")
-        close_btn.clicked.connect(lambda: threading.Thread(
-            target=self._carla.open_doors, args=(False,), daemon=True).start())
-        doors_layout.addWidget(open_btn)
-        doors_layout.addWidget(close_btn)
+        dh = QHBoxLayout(doors_grp)
+        ob = QPushButton("Open All (O)")
+        ob.clicked.connect(lambda: threading.Thread(target=self._carla.open_doors, args=(True,), daemon=True).start())
+        cb = QPushButton("Close All")
+        cb.clicked.connect(lambda: threading.Thread(target=self._carla.open_doors, args=(False,), daemon=True).start())
+        dh.addWidget(ob); dh.addWidget(cb)
         v.addWidget(doors_grp)
 
         v.addStretch()
         return w
 
-    # ── Controls tab ─────────────────────────────────────────────────────────
-    def _build_controls_tab(self):
+    # ── Map & Route ──────────────────────────────────────────────────────────
+    def _build_map_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
 
-        note = QLabel(
-            "These replicate manual_control.py hotkeys. Vehicle must be spawned. "
-            "Autopilot must be OFF for throttle/steer/brake."
-        )
+        # Toolbar
+        toolbar = QHBoxLayout()
+        load_map_btn = QPushButton("Load Map")
+        load_map_btn.clicked.connect(self._load_map)
+        fit_btn = QPushButton("Fit")
+        fit_btn.clicked.connect(lambda: self._map_view.fit_scene())
+
+        self._placement_combo = QComboBox()
+        self._placement_combo.addItems(["Click = Set Spawn/Route", "Click = Place Pedestrian", "Click = Place NPC"])
+        self._placement_combo.currentIndexChanged.connect(self._on_placement_mode_changed)
+
+        clear_route_btn = QPushButton("Clear Route")
+        clear_route_btn.clicked.connect(self._clear_route)
+
+        toolbar.addWidget(load_map_btn)
+        toolbar.addWidget(fit_btn)
+        toolbar.addWidget(QLabel("Click mode:"))
+        toolbar.addWidget(self._placement_combo)
+        toolbar.addWidget(clear_route_btn)
+        toolbar.addStretch()
+        v.addLayout(toolbar)
+
+        # Map canvas
+        self._map_view = MapView(self._map_scene)
+        v.addWidget(self._map_view, stretch=1)
+
+        # Route / Run controls
+        run_grp = QGroupBox("Route & Scenario Run")
+        rg = QGridLayout(run_grp)
+
+        rg.addWidget(QLabel("Start:"), 0, 0)
+        self._route_start_lbl = QLabel("— (click map)")
+        rg.addWidget(self._route_start_lbl, 0, 1)
+
+        rg.addWidget(QLabel("End:"), 0, 2)
+        self._route_end_lbl = QLabel("— (click map)")
+        rg.addWidget(self._route_end_lbl, 0, 3)
+
+        rg.addWidget(QLabel("Speed limit (m/s):"), 1, 0)
+        self._speed_limit_spin = QDoubleSpinBox()
+        self._speed_limit_spin.setRange(1, 50)
+        self._speed_limit_spin.setValue(10.0)
+        rg.addWidget(self._speed_limit_spin, 1, 1)
+
+        rg.addWidget(QLabel("Stop after (s):"), 1, 2)
+        self._stop_time_spin = QSpinBox()
+        self._stop_time_spin.setRange(1, 3600)
+        self._stop_time_spin.setValue(30)
+        rg.addWidget(self._stop_time_spin, 1, 3)
+
+        self._run_btn = QPushButton("▶ RUN")
+        self._run_btn.setFixedHeight(36)
+        self._run_btn.setStyleSheet("background:#2ecc71;color:white;font-weight:bold;")
+        self._run_btn.clicked.connect(self._run_scenario)
+        rg.addWidget(self._run_btn, 2, 0, 1, 2)
+
+        self._stop_btn = QPushButton("■ STOP")
+        self._stop_btn.setFixedHeight(36)
+        self._stop_btn.setStyleSheet("background:#e74c3c;color:white;font-weight:bold;")
+        self._stop_btn.clicked.connect(self._stop_scenario)
+        self._stop_btn.setEnabled(False)
+        rg.addWidget(self._stop_btn, 2, 2, 1, 2)
+
+        self._run_progress = QProgressBar()
+        self._run_progress.setRange(0, 100)
+        self._run_progress.setValue(0)
+        rg.addWidget(self._run_progress, 3, 0, 1, 4)
+
+        v.addWidget(run_grp)
+        return w
+
+    # ── Controls ─────────────────────────────────────────────────────────────
+    def _build_controls_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        note = QLabel("Autopilot must be OFF for sliders to take effect.")
         note.setWordWrap(True)
         v.addWidget(note)
 
-        # Throttle / Brake / Steer sliders
         drive_grp = QGroupBox("Drive Controls")
         g = QGridLayout(drive_grp)
 
@@ -262,45 +328,38 @@ class CarlaGuiApp(QMainWindow):
         g.addWidget(self._handbrake_check, 3, 1)
 
         g.addWidget(QLabel("Reverse:"), 4, 0)
-        self._reverse_check = QCheckBox("Q — toggle reverse")
+        self._reverse_check = QCheckBox("Q")
         self._reverse_check.stateChanged.connect(lambda _: self._send_control())
         g.addWidget(self._reverse_check, 4, 1)
 
-        reset_btn = QPushButton("Reset all to 0")
+        reset_btn = QPushButton("Reset all")
         reset_btn.clicked.connect(self._reset_controls)
         g.addWidget(reset_btn, 5, 0, 1, 3)
-
         v.addWidget(drive_grp)
 
-        # Action buttons row
-        action_grp = QGroupBox("Actions (hotkeys from manual_control.py)")
+        action_grp = QGroupBox("Hotkey Actions")
         ag = QGridLayout(action_grp)
-
         actions = [
             ("Toggle Autopilot (P)", self._toggle_autopilot),
-            ("Toggle Camera (TAB)", lambda: self._log_action("camera toggle — needs pygame window")),
             ("Next Weather (C)", self._next_weather),
             ("Prev Weather (Shift+C)", self._prev_weather),
-            ("Toggle Radar (G)", lambda: self._log_action("Radar toggle — needs sensor setup")),
-            ("Toggle Recording (R)", lambda: self._log_action("Recording toggle — CTRL+R in full client")),
             ("Open Doors (O)", lambda: threading.Thread(target=self._carla.open_doors, args=(True,), daemon=True).start()),
             ("Close Doors", lambda: threading.Thread(target=self._carla.open_doors, args=(False,), daemon=True).start()),
             ("High Beam (Shift+L)", lambda: threading.Thread(target=self._carla.set_light_state, args=("High Beam",), daemon=True).start()),
             ("Left Blinker (Z)", lambda: threading.Thread(target=self._carla.set_light_state, args=("Left Blinker",), daemon=True).start()),
             ("Right Blinker (X)", lambda: threading.Thread(target=self._carla.set_light_state, args=("Right Blinker",), daemon=True).start()),
             ("All Lights On", lambda: threading.Thread(target=self._carla.set_light_state, args=("All",), daemon=True).start()),
+            ("Lights Off", lambda: threading.Thread(target=self._carla.set_light_state, args=("Off",), daemon=True).start()),
         ]
-
         for i, (label, fn) in enumerate(actions):
             btn = QPushButton(label)
             btn.clicked.connect(fn)
             ag.addWidget(btn, i // 3, i % 3)
-
         v.addWidget(action_grp)
         v.addStretch()
         return w
 
-    # ── Weather tab ──────────────────────────────────────────────────────────
+    # ── Weather ──────────────────────────────────────────────────────────────
     def _build_weather_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -317,28 +376,18 @@ class CarlaGuiApp(QMainWindow):
         v.addWidget(preset_grp)
 
         nav_row = QHBoxLayout()
-        prev_w = QPushButton("◀ Prev (Shift+C)")
-        prev_w.clicked.connect(self._prev_weather)
-        next_w = QPushButton("Next (C) ▶")
-        next_w.clicked.connect(self._next_weather)
-        nav_row.addWidget(prev_w)
-        nav_row.addWidget(next_w)
+        nav_row.addWidget(QPushButton("◀ Prev", clicked=self._prev_weather))
+        nav_row.addWidget(QPushButton("Next ▶", clicked=self._next_weather))
         v.addLayout(nav_row)
 
-        # Custom sliders
         custom_grp = QGroupBox("Custom Parameters")
         cg = QGridLayout(custom_grp)
         self._weather_sliders = {}
         params = [
-            ("cloudiness", 0, 100),
-            ("precipitation", 0, 100),
-            ("precipitation_deposits", 0, 100),
-            ("wind_intensity", 0, 100),
-            ("sun_azimuth_angle", 0, 360),
-            ("sun_altitude_angle", -90, 90),
-            ("fog_density", 0, 100),
-            ("fog_distance", 0, 100),
-            ("wetness", 0, 100),
+            ("cloudiness", 0, 100), ("precipitation", 0, 100),
+            ("precipitation_deposits", 0, 100), ("wind_intensity", 0, 100),
+            ("sun_azimuth_angle", 0, 360), ("sun_altitude_angle", -90, 90),
+            ("fog_density", 0, 100), ("fog_distance", 0, 100), ("wetness", 0, 100),
         ]
         for row, (name, lo, hi) in enumerate(params):
             cg.addWidget(QLabel(name.replace("_", " ").title() + ":"), row, 0)
@@ -348,60 +397,31 @@ class CarlaGuiApp(QMainWindow):
             cg.addWidget(sl, row, 1)
             cg.addWidget(lbl, row, 2)
             self._weather_sliders[name] = sl
-
         apply_custom = QPushButton("Apply Custom")
         apply_custom.clicked.connect(self._apply_custom_weather)
         cg.addWidget(apply_custom, len(params), 0, 1, 3)
         v.addWidget(custom_grp)
-
         v.addStretch()
         return w
 
-    # ── Scenarios tab ────────────────────────────────────────────────────────
-    def _build_scenarios_tab(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
-
-        note = QLabel(
-            "Spawn open scenarios in the connected CARLA world. "
-            "A vehicle must NOT need to be pre-spawned — scenarios handle their own actors."
+    # ── Scenarios ────────────────────────────────────────────────────────────
+    def _build_scenarios_full_tab(self):
+        self._scenario_panel = ScenarioPanel(
+            self._carla,
+            log_fn=lambda m: self._bridge.log_signal.emit(m),
+            get_map_selection_fn=lambda: self._last_map_click,
         )
-        note.setWordWrap(True)
-        v.addWidget(note)
+        return self._scenario_panel
 
-        sc_grp = QGroupBox("Open Scenario")
-        sh = QHBoxLayout(sc_grp)
-        self._scenario_combo = QComboBox()
-        self._scenario_combo.addItems(SCENARIO_LIST)
-        sh.addWidget(QLabel("Scenario:"))
-        sh.addWidget(self._scenario_combo, stretch=1)
-        run_btn = QPushButton("Run Scenario")
-        run_btn.clicked.connect(self._run_scenario)
-        sh.addWidget(run_btn)
-        clear_btn = QPushButton("Clear Actors")
-        clear_btn.clicked.connect(self._clear_scenario)
-        sh.addWidget(clear_btn)
-        v.addWidget(sc_grp)
-
-        v.addStretch()
-        return w
-
-    # ── Terminal tab ─────────────────────────────────────────────────────────
+    # ── Terminal ─────────────────────────────────────────────────────────────
     def _build_terminal_tab(self):
         w = QWidget()
         v = QVBoxLayout(w)
-
-        label = QLabel("CARLA client log — errors, warnings, and status messages appear here.")
-        v.addWidget(label)
-
         self._terminal = QTextEdit()
         self._terminal.setReadOnly(True)
         self._terminal.setFont(QFont("Monospace", 9))
-        self._terminal.setStyleSheet(
-            "background:#111; color:#e0e0e0;"
-        )
+        self._terminal.setStyleSheet("background:#111; color:#e0e0e0;")
         v.addWidget(self._terminal, stretch=1)
-
         clear_btn = QPushButton("Clear")
         clear_btn.clicked.connect(self._terminal.clear)
         v.addWidget(clear_btn)
@@ -423,12 +443,9 @@ class CarlaGuiApp(QMainWindow):
         self._terminal.insertHtml(f'<span style="color:{color}">{msg}</span><br>')
         self._terminal.moveCursor(QTextCursor.End)
 
-    def _log_action(self, msg: str):
-        self._bridge.log_signal.emit(f"[INFO] {msg}")
-
     def _set_connected(self, connected: bool):
         color = "#2ecc71" if connected else "#e74c3c"
-        self._status_dot.setStyleSheet(f"color: {color}; font-size:16px;")
+        self._status_dot.setStyleSheet(f"color:{color};font-size:16px;")
         self._status_label.setText("Connected" if connected else "Disconnected")
         self._connect_btn.setEnabled(not connected)
         self._disconnect_btn.setEnabled(connected)
@@ -444,8 +461,126 @@ class CarlaGuiApp(QMainWindow):
         self._weather_combo.clear()
         self._weather_combo.addItems(presets)
 
+    def _draw_map(self, segments, transforms):
+        self._map_scene.clear()
+        self._map_scene.draw_roads(segments)
+        self._map_scene.draw_spawn_points(transforms, callback=None)
+        self._spawn_transforms = transforms
+        self._map_view.fit_scene()
+
     # ─────────────────────────────────────────────────────────────────────────
-    # Actions
+    # Map interactions
+    # ─────────────────────────────────────────────────────────────────────────
+    def _on_placement_mode_changed(self, idx):
+        modes = [None, 'pedestrian', 'npc']
+        self._placement_mode = modes[idx]
+        self._map_scene.set_placement_mode(self._placement_mode)
+
+    def _on_spawn_clicked(self, idx: int, transform):
+        """Green dot on map clicked — depends on current placement mode."""
+        mode = self._placement_mode
+        x = transform.location.x
+        y = transform.location.y
+        z = transform.location.z
+
+        if mode is None:
+            # First click = start, second = end
+            if self._route_start is None:
+                self._route_start = transform
+                self._route_start_lbl.setText(f"({x:.1f}, {y:.1f})")
+                self._map_scene.add_marker(x, y, START_COLOR, "S")
+                self._spawn_location_lbl.setText(f"Spawn: ({x:.1f}, {y:.1f}, {z:.1f})")
+                self._append_log(f"[INFO] Route start set: spawn #{idx}")
+            else:
+                self._route_end = transform
+                self._route_end_lbl.setText(f"({x:.1f}, {y:.1f})")
+                self._map_scene.add_marker(x, y, END_COLOR, "E")
+                self._append_log(f"[INFO] Route end set: spawn #{idx} — computing route...")
+                threading.Thread(target=self._compute_route, daemon=True).start()
+        elif mode == 'pedestrian':
+            self._last_map_click = (x, y, z)
+            self._map_scene.add_marker(x, y, PED_COLOR, "P")
+            self._append_log(f"[INFO] Pedestrian waypoint set at ({x:.1f}, {y:.1f}). Use 'Spawn at Map Click' in Scenarios.")
+        elif mode == 'npc':
+            self._last_map_click = (x, y, z)
+            self._map_scene.add_marker(x, y, NPC_COLOR, "N")
+            self._append_log(f"[INFO] NPC waypoint set at ({x:.1f}, {y:.1f}). Use 'Use Map Click Position' in Scenarios.")
+
+    def _on_waypoint_clicked(self, x: float, y: float):
+        """Blank map area clicked in pedestrian/npc mode."""
+        self._last_map_click = (x, y, 0.5)
+        color = PED_COLOR if self._placement_mode == 'pedestrian' else NPC_COLOR
+        label = "P" if self._placement_mode == 'pedestrian' else "N"
+        self._map_scene.add_marker(x, y, color, label)
+        self._append_log(f"[INFO] Waypoint set at ({x:.1f}, {y:.1f})")
+
+    def _compute_route(self):
+        if not self._route_planner:
+            self._append_log("[WARN] Route planner not ready. Connect first.")
+            return
+        waypoints = self._route_planner.plan(self._route_start, self._route_end)
+        if waypoints:
+            self._map_scene.draw_route(waypoints)
+            self._append_log(f"[OK] Route computed: {len(waypoints)} waypoints.")
+        else:
+            self._append_log("[WARN] Could not compute route — GlobalRoutePlanner may not be available.")
+
+    def _clear_route(self):
+        self._route_start = None
+        self._route_end = None
+        self._route_start_lbl.setText("— (click map)")
+        self._route_end_lbl.setText("— (click map)")
+        self._map_scene.clear_markers()
+        self._append_log("[INFO] Route cleared.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Run / Stop
+    # ─────────────────────────────────────────────────────────────────────────
+    def _run_scenario(self):
+        if not self._carla.connected:
+            self._append_log("[ERR] Not connected to CARLA.")
+            return
+        # Set autopilot + speed for ego
+        if self._carla.player:
+            speed = self._speed_limit_spin.value()
+            self._carla.set_autopilot(True)
+            try:
+                tm = self._carla.client.get_trafficmanager()
+                tm.set_desired_speed(self._carla.player, speed)
+            except Exception as exc:
+                self._append_log(f"[WARN] Could not set TM speed: {exc}")
+
+        stop_time = self._stop_time_spin.value()
+        self._run_elapsed = 0
+        self._run_progress.setRange(0, stop_time)
+        self._run_progress.setValue(0)
+        self._run_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+
+        self._run_timer = QTimer()
+        self._run_timer.timeout.connect(lambda: self._tick_run(stop_time))
+        self._run_timer.start(1000)
+        self._append_log(f"[OK] ▶ Scenario running — stop after {stop_time}s.")
+
+    def _tick_run(self, stop_time: int):
+        self._run_elapsed += 1
+        self._run_progress.setValue(self._run_elapsed)
+        if self._run_elapsed >= stop_time:
+            self._stop_scenario()
+
+    def _stop_scenario(self):
+        if self._run_timer:
+            self._run_timer.stop()
+            self._run_timer = None
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._run_progress.setValue(0)
+        if self._carla.player:
+            threading.Thread(target=self._carla.set_autopilot, args=(False,), daemon=True).start()
+        self._append_log("[INFO] ■ Scenario stopped.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Connection actions
     # ─────────────────────────────────────────────────────────────────────────
     def _scan_ports(self):
         host = self._host_edit.text().strip()
@@ -455,10 +590,8 @@ class CarlaGuiApp(QMainWindow):
         def _do():
             ports = scan_ports(host)
             self._port_list.addItems([str(p) for p in ports])
-            if ports:
-                self._bridge.log_signal.emit(f"[OK] Found ports: {ports}")
-            else:
-                self._bridge.log_signal.emit("[WARN] No open CARLA ports found.")
+            self._bridge.log_signal.emit(
+                f"[OK] Found: {ports}" if ports else "[WARN] No CARLA ports found.")
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -471,36 +604,76 @@ class CarlaGuiApp(QMainWindow):
             ok = self._carla.connect(host, port)
             self._bridge.status_signal.emit(ok)
             if ok:
-                bps = self._carla.get_vehicle_blueprints()
-                self._bridge.blueprints_signal.emit(bps)
-                presets = self._carla.get_weather_presets()
-                self._bridge.weather_signal.emit(presets)
-                self._scenario_runner = ScenarioRunner(
-                    self._carla, on_log=lambda m: self._bridge.log_signal.emit(m)
-                )
+                self._route_planner = RoutePlanner(self._carla)
+                self._bridge.blueprints_signal.emit(self._carla.get_vehicle_blueprints())
+                self._bridge.weather_signal.emit(self._carla.get_weather_presets())
+                # Load map topology for 2D view
+                segments = self._route_planner.get_map_topology()
+                transforms = self._route_planner.get_spawn_points()
+                self._bridge.map_loaded_signal.emit(segments, transforms)
+                # Update scenario config
+                self._scenario_panel.update_config("host", host)
+                self._scenario_panel.update_config("port", port)
 
         threading.Thread(target=_do, daemon=True).start()
 
     def _disconnect(self):
         self._carla.disconnect()
         self._bridge.status_signal.emit(False)
+        self._route_planner = None
 
+    def _load_map(self):
+        if not self._carla.connected:
+            self._append_log("[ERR] Not connected.")
+            return
+        threading.Thread(target=self._do_load_map, daemon=True).start()
+
+    def _do_load_map(self):
+        if not self._route_planner:
+            return
+        segments = self._route_planner.get_map_topology()
+        transforms = self._route_planner.get_spawn_points()
+        self._bridge.map_loaded_signal.emit(segments, transforms)
+        self._bridge.log_signal.emit(f"[OK] Map loaded: {len(transforms)} spawn points, {len(segments)} road segments.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Vehicle
+    # ─────────────────────────────────────────────────────────────────────────
     def _load_blueprints(self):
         threading.Thread(
             target=lambda: self._bridge.blueprints_signal.emit(self._carla.get_vehicle_blueprints()),
-            daemon=True,
-        ).start()
+            daemon=True).start()
 
     def _refresh_info(self):
         if self._carla.connected:
-            self._info_map.setText(self._carla.get_map_name())
+            m = self._carla.get_map_name()
+            self._info_map.setText(m)
             self._info_loc.setText(self._carla.get_spectator_location())
-            self._map_label.setText(f"Map: {self._carla.get_map_name()}")
+            self._map_label.setText(f"Map: {m}")
 
     def _spawn_vehicle(self):
         bp = self._bp_combo.currentText()
         ap = self._autopilot_check.isChecked()
-        threading.Thread(target=self._carla.spawn_vehicle, args=(bp, ap), daemon=True).start()
+        # Use route_start as spawn if set
+        if self._route_start:
+            import carla
+            def _do():
+                if not self._carla.world:
+                    return
+                bp_obj = self._carla.world.get_blueprint_library().find(bp)
+                if bp_obj.has_attribute("role_name"):
+                    bp_obj.set_attribute("role_name", "hero")
+                actor = self._carla.world.try_spawn_actor(bp_obj, self._route_start)
+                if actor:
+                    self._carla.player = actor
+                    if ap:
+                        actor.set_autopilot(True)
+                    self._bridge.log_signal.emit(f"[OK] Spawned {bp} at selected map point.")
+                else:
+                    self._bridge.log_signal.emit("[ERR] Spawn failed at selected point.")
+            threading.Thread(target=_do, daemon=True).start()
+        else:
+            threading.Thread(target=self._carla.spawn_vehicle, args=(bp, ap), daemon=True).start()
 
     def _destroy_vehicle(self):
         threading.Thread(target=self._carla.destroy_vehicle, daemon=True).start()
@@ -510,64 +683,51 @@ class CarlaGuiApp(QMainWindow):
         threading.Thread(target=self._carla.set_autopilot, args=(self._autopilot_state,), daemon=True).start()
 
     def _send_control(self):
-        threading.Thread(
-            target=self._carla.apply_control,
-            kwargs=dict(
-                throttle=self._throttle_slider.value() / 100.0,
-                steer=self._steer_slider.value() / 100.0,
-                brake=self._brake_slider.value() / 100.0,
-                hand_brake=self._handbrake_check.isChecked(),
-                reverse=self._reverse_check.isChecked(),
-            ),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._carla.apply_control, kwargs=dict(
+            throttle=self._throttle_slider.value() / 100.0,
+            steer=self._steer_slider.value() / 100.0,
+            brake=self._brake_slider.value() / 100.0,
+            hand_brake=self._handbrake_check.isChecked(),
+            reverse=self._reverse_check.isChecked(),
+        ), daemon=True).start()
 
     def _reset_controls(self):
-        for sl in (self._throttle_slider, self._brake_slider):
-            sl.setValue(0)
+        self._throttle_slider.setValue(0)
+        self._brake_slider.setValue(0)
         self._steer_slider.setValue(0)
         self._handbrake_check.setChecked(False)
         self._reverse_check.setChecked(False)
 
-    # weather index tracker
+    # ─────────────────────────────────────────────────────────────────────────
+    # Weather
+    # ─────────────────────────────────────────────────────────────────────────
     _weather_idx = 0
 
     def _next_weather(self):
         presets = [self._weather_combo.itemText(i) for i in range(self._weather_combo.count())]
-        if not presets:
-            return
+        if not presets: return
         self._weather_idx = (self._weather_idx + 1) % len(presets)
         self._weather_combo.setCurrentIndex(self._weather_idx)
         threading.Thread(target=self._carla.set_weather, args=(presets[self._weather_idx],), daemon=True).start()
 
     def _prev_weather(self):
         presets = [self._weather_combo.itemText(i) for i in range(self._weather_combo.count())]
-        if not presets:
-            return
+        if not presets: return
         self._weather_idx = (self._weather_idx - 1) % len(presets)
         self._weather_combo.setCurrentIndex(self._weather_idx)
         threading.Thread(target=self._carla.set_weather, args=(presets[self._weather_idx],), daemon=True).start()
 
     def _apply_weather_preset(self):
-        preset = self._weather_combo.currentText()
-        threading.Thread(target=self._carla.set_weather, args=(preset,), daemon=True).start()
+        threading.Thread(
+            target=self._carla.set_weather,
+            args=(self._weather_combo.currentText(),), daemon=True).start()
+        self._scenario_panel.update_config("weather_preset", self._weather_combo.currentText())
 
     def _apply_custom_weather(self):
         params = {k: sl.value() for k, sl in self._weather_sliders.items()}
         threading.Thread(target=self._carla.set_weather_custom, args=(params,), daemon=True).start()
 
-    def _run_scenario(self):
-        if not self._scenario_runner:
-            self._append_log("[ERR] Not connected to CARLA.")
-            return
-        self._scenario_runner.run(self._scenario_combo.currentText())
 
-    def _clear_scenario(self):
-        if self._scenario_runner:
-            threading.Thread(target=self._scenario_runner.cleanup, daemon=True).start()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 def launch():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
