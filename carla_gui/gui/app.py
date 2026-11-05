@@ -16,6 +16,8 @@ from carla_client.client import CarlaClient, scan_ports
 from carla_client.route_planner import RoutePlanner
 from gui.map_view import MapScene, MapView, START_COLOR, END_COLOR, PED_COLOR, NPC_COLOR
 from gui.scenario_panel import ScenarioPanel
+from gui.sensor_placer import SensorPlacerWidget, SENSOR_TYPES
+from gui.sensor_window import SensorFeedWindow, SensorManager
 from scenarios.pedestrian_crossing import ScenarioRunner
 
 log = logging.getLogger(__name__)
@@ -51,6 +53,8 @@ class CarlaGuiApp(QMainWindow):
         self._placement_mode = None
         self._run_timer = None
         self._run_elapsed = 0
+        self._sensor_manager: SensorManager = None
+        self._sensor_feed_window: SensorFeedWindow = None
 
         # Map scene (created early so scenario panel can reference it)
         self._map_scene = MapScene()
@@ -91,6 +95,7 @@ class CarlaGuiApp(QMainWindow):
         tabs.addTab(self._build_controls_tab(), "🎮 Controls")
         tabs.addTab(self._build_weather_tab(), "🌦 Weather")
         tabs.addTab(self._build_scenarios_full_tab(), "🎭 Scenarios")
+        tabs.addTab(self._build_sensors_tab(), "📷 Sensors")
         tabs.addTab(self._build_terminal_tab(), "🖥 Terminal")
 
     # ── Connection ───────────────────────────────────────────────────────────
@@ -412,6 +417,70 @@ class CarlaGuiApp(QMainWindow):
             get_map_selection_fn=lambda: self._last_map_click,
         )
         return self._scenario_panel
+
+    # ── Sensors ──────────────────────────────────────────────────────────────
+    def _build_sensors_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        note = QLabel(
+            "Place sensors on the vehicle using the views below.\n"
+            "Top/Front/Side: left-click to place, drag to reposition, right-drag to rotate.\n"
+            "3D iso: drag to orbit. Click 'Show Live Feed' to open the sensor window."
+        )
+        note.setWordWrap(True)
+        v.addWidget(note)
+
+        self._sensor_placer = SensorPlacerWidget()
+        v.addWidget(self._sensor_placer, stretch=1)
+
+        btn_row = QHBoxLayout()
+        show_btn = QPushButton("▶ Show Live Feed Window")
+        show_btn.setFixedHeight(36)
+        show_btn.setStyleSheet("background:#2980b9;color:white;font-weight:bold;")
+        show_btn.clicked.connect(self._open_sensor_feed)
+        btn_row.addWidget(show_btn)
+
+        detach_btn = QPushButton("■ Detach All Sensors")
+        detach_btn.setFixedHeight(36)
+        detach_btn.clicked.connect(self._detach_all_sensors)
+        btn_row.addWidget(detach_btn)
+        v.addLayout(btn_row)
+        return w
+
+    def _open_sensor_feed(self):
+        if not self._carla.connected:
+            self._append_log("[ERR] Connect to CARLA before opening sensor feed.")
+            return
+        if not self._carla.player:
+            self._append_log("[ERR] Spawn a vehicle first — sensors attach to the ego vehicle.")
+            return
+
+        handles = self._sensor_placer.get_handles()
+        if not handles:
+            self._append_log("[WARN] No sensors placed. Click in a view to place one first.")
+            return
+
+        # Create manager and window once
+        if self._sensor_manager is None:
+            self._sensor_manager = SensorManager(
+                self._carla,
+                log_fn=lambda m: self._bridge.log_signal.emit(m),
+            )
+        if self._sensor_feed_window is None:
+            self._sensor_feed_window = SensorFeedWindow()
+
+        for handle in handles:
+            self._sensor_feed_window.open_sensor(handle, self._sensor_manager)
+
+        self._sensor_feed_window.show()
+        self._sensor_feed_window.raise_()
+        self._append_log(f"[OK] Opening sensor feed for {len(handles)} sensor(s).")
+
+    def _detach_all_sensors(self):
+        if self._sensor_feed_window and self._sensor_manager:
+            self._sensor_feed_window.close_all(self._sensor_manager)
+        self._append_log("[OK] All sensors detached.")
 
     # ── Terminal ─────────────────────────────────────────────────────────────
     def _build_terminal_tab(self):
