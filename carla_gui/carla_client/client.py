@@ -85,11 +85,41 @@ class CarlaClient:
         except Exception:
             return WEATHER_PRESETS
 
+    def get_available_maps(self) -> List[str]:
+        """Return sorted list of cooked maps available on the server."""
+        if not self.client:
+            return []
+        try:
+            maps = self.client.get_available_maps()
+            # Paths look like /Game/Carla/Maps/Town01 — keep just the short name
+            names = sorted(set(m.split("/")[-1] for m in maps))
+            return names
+        except Exception as exc:
+            self._log(f"[ERR] get_available_maps: {exc}")
+            return []
+
+    def load_map(self, map_name: str) -> bool:
+        """Load a map by short name (e.g. 'Town03'). Blocks until world reloads."""
+        if not self.client:
+            self._log("[ERR] Not connected.")
+            return False
+        try:
+            self._log(f"[INFO] Loading map: {map_name} (may take 10-30s)...")
+            self.client.load_world(map_name)
+            self.world = self.client.get_world()
+            # Vehicle is gone after map change
+            self.player = None
+            self._log(f"[OK] Map loaded: {map_name}")
+            return True
+        except Exception as exc:
+            self._log(f"[ERR] load_map '{map_name}': {exc}")
+            return False
+
     def get_map_name(self) -> str:
         if not self.world:
             return "N/A"
         try:
-            return self.world.get_map().name
+            return self.world.get_map().name.split("/")[-1]
         except Exception:
             return "N/A"
 

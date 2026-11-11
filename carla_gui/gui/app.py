@@ -30,6 +30,7 @@ class _Bridge(QObject):
     weather_signal = pyqtSignal(list)
     status_signal = pyqtSignal(bool)
     map_loaded_signal = pyqtSignal(list, list)   # segments, spawn_transforms
+    available_maps_signal = pyqtSignal(list)
 
 
 class CarlaGuiApp(QMainWindow):
@@ -44,6 +45,7 @@ class CarlaGuiApp(QMainWindow):
         self._bridge.weather_signal.connect(self._populate_weather)
         self._bridge.status_signal.connect(self._on_connection_changed)
         self._bridge.map_loaded_signal.connect(self._draw_map)
+        self._bridge.available_maps_signal.connect(self._populate_maps)
 
         self._carla = CarlaClient(on_log=lambda m: self._bridge.log_signal.emit(m))
         self._route_planner = None
@@ -145,6 +147,27 @@ class CarlaGuiApp(QMainWindow):
         ig.addWidget(QLabel("Map:"), 0, 0); ig.addWidget(self._info_map, 0, 1)
         ig.addWidget(QLabel("Spectator:"), 1, 0); ig.addWidget(self._info_loc, 1, 1)
         v.addWidget(info_grp)
+
+        # ── Map switcher ──────────────────────────────────────────────────
+        map_grp = QGroupBox("Switch Map")
+        map_grp.setToolTip("Lists all cooked maps available on the connected CARLA server")
+        mh = QHBoxLayout(map_grp)
+        mh.addWidget(QLabel("Available maps:"))
+        self._map_combo = QComboBox()
+        self._map_combo.setMinimumWidth(200)
+        self._map_combo.setPlaceholderText("Connect first…")
+        mh.addWidget(self._map_combo, stretch=1)
+        self._refresh_maps_btn = QPushButton("↻")
+        self._refresh_maps_btn.setFixedWidth(32)
+        self._refresh_maps_btn.setToolTip("Refresh map list from server")
+        self._refresh_maps_btn.clicked.connect(self._load_available_maps)
+        mh.addWidget(self._refresh_maps_btn)
+        self._load_map_btn = QPushButton("Load Map")
+        self._load_map_btn.setFixedHeight(30)
+        self._load_map_btn.setStyleSheet("background:#8e44ad;color:white;font-weight:bold;")
+        self._load_map_btn.clicked.connect(self._switch_map)
+        mh.addWidget(self._load_map_btn)
+        v.addWidget(map_grp)
 
         self._info_timer = QTimer()
         self._info_timer.timeout.connect(self._refresh_info)
@@ -760,6 +783,8 @@ class CarlaGuiApp(QMainWindow):
                 # Update scenario config
                 self._scenario_panel.update_config("host", host)
                 self._scenario_panel.update_config("port", port)
+                # Populate map switcher
+                self._bridge.available_maps_signal.emit(self._carla.get_available_maps())
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -781,6 +806,65 @@ class CarlaGuiApp(QMainWindow):
         transforms = self._route_planner.get_spawn_points()
         self._bridge.map_loaded_signal.emit(segments, transforms)
         self._bridge.log_signal.emit(f"[OK] Map loaded: {len(transforms)} spawn points, {len(segments)} road segments.")
+
+    # ── Map switcher ──────────────────────────────────────────────────────────
+    def _load_available_maps(self):
+        """Background: fetch map list from CARLA and emit to populate combo."""
+        if not self._carla.connected:
+            self._append_log("[ERR] Not connected — cannot fetch map list.")
+            return
+        threading.Thread(
+            target=lambda: self._bridge.available_maps_signal.emit(
+                self._carla.get_available_maps()),
+            daemon=True).start()
+
+    def _populate_maps(self, maps: list):
+        """Slot: fill the map dropdown (called on main thread via signal)."""
+        self._map_combo.clear()
+        if maps:
+            self._map_combo.addItems(maps)
+            current = self._carla.get_map_name()
+            idx = self._map_combo.findText(current)
+            if idx >= 0:
+                self._map_combo.setCurrentIndex(idx)
+        else:
+            self._map_combo.setPlaceholderText("No maps found")
+        # Always re-enable button (also covers post-switch re-population)
+        self._load_map_btn.setEnabled(True)
+        self._load_map_btn.setText("Load Map")
+
+    def _switch_map(self):
+        """Load the map selected in the dropdown; reload topology afterwards."""
+        map_name = self._map_combo.currentText()
+        if not map_name:
+            self._append_log("[ERR] No map selected.")
+            return
+        if not self._carla.connected:
+            self._append_log("[ERR] Not connected.")
+            return
+        self._load_map_btn.setEnabled(False)
+        self._load_map_btn.setText("Loading…")
+
+        def _do():
+            ok = self._carla.load_map(map_name)
+            if ok and self._route_planner:
+                self._route_planner = RoutePlanner(self._carla)
+                segments = self._route_planner.get_map_topology()
+                transforms = self._route_planner.get_spawn_points()
+                self._bridge.map_loaded_signal.emit(segments, transforms)
+                self._bridge.blueprints_signal.emit(self._carla.get_vehicle_blueprints())
+            self._bridge.log_signal.emit(
+                f"[OK] Switched to {map_name}." if ok else f"[ERR] Failed to load {map_name}.")
+            # Re-enable button on main thread via a one-shot signal
+            self._bridge.available_maps_signal.emit(
+                self._carla.get_available_maps() if ok else [])
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_maps_repopulated(self, maps: list):
+        """Re-enable Load Map button after a switch."""
+        self._load_map_btn.setEnabled(True)
+        self._load_map_btn.setText("Load Map")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Vehicle
