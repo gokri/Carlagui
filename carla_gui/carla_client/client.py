@@ -259,6 +259,29 @@ class CarlaClient:
         except Exception as exc:
             self._log(f"[ERR] set_weather_custom: {exc}")
 
+    # ------------------------------------------------------------------ map switching
+    def get_available_maps(self) -> List[str]:
+        if not self.client:
+            return []
+        try:
+            maps = sorted(self.client.get_available_maps())
+            return [m.split('/')[-1] for m in maps]
+        except Exception as exc:
+            self._log(f"[ERR] get_available_maps: {exc}")
+            return []
+
+    def load_world(self, map_name: str):
+        if not self.client:
+            self._log("[ERR] Not connected.")
+            return
+        try:
+            self._log(f"[INFO] Loading map {map_name} — this may take 10–30s ...")
+            self.world = self.client.load_world(map_name)
+            self.player = None
+            self._log(f"[OK] Map loaded: {map_name}")
+        except Exception as exc:
+            self._log(f"[ERR] load_world: {exc}")
+
     # ------------------------------------------------------------------ map layers
     def load_map_layer(self, layer_name: str, load: bool = True):
         if not self.world:

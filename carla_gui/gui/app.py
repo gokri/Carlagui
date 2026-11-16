@@ -140,6 +140,23 @@ class CarlaGuiApp(QMainWindow):
         btn_row.addWidget(self._disconnect_btn)
         v.addLayout(btn_row)
 
+        map_grp = QGroupBox("Map Switcher")
+        mh = QHBoxLayout(map_grp)
+        mh.addWidget(QLabel("Map:"))
+        self._map_combo = QComboBox()
+        self._map_combo.setMinimumWidth(200)
+        mh.addWidget(self._map_combo, stretch=1)
+        refresh_maps_btn = QPushButton("↻")
+        refresh_maps_btn.setFixedWidth(32)
+        refresh_maps_btn.clicked.connect(self._refresh_maps)
+        mh.addWidget(refresh_maps_btn)
+        load_map_btn = QPushButton("Load Map")
+        load_map_btn.setFixedHeight(32)
+        load_map_btn.setStyleSheet("background:#8e44ad;color:white;font-weight:bold;")
+        load_map_btn.clicked.connect(self._switch_map)
+        mh.addWidget(load_map_btn)
+        v.addWidget(map_grp)
+
         info_grp = QGroupBox("Server Info")
         ig = QGridLayout(info_grp)
         self._info_map = QLabel("—")
@@ -776,6 +793,10 @@ class CarlaGuiApp(QMainWindow):
                 self._route_planner = RoutePlanner(self._carla)
                 self._bridge.blueprints_signal.emit(self._carla.get_vehicle_blueprints())
                 self._bridge.weather_signal.emit(self._carla.get_weather_presets())
+                maps = self._carla.get_available_maps()
+                if maps:
+                    self._map_combo.clear()
+                    self._map_combo.addItems(maps)
                 # Load map topology for 2D view
                 segments = self._route_planner.get_map_topology()
                 transforms = self._route_planner.get_spawn_points()
@@ -786,6 +807,32 @@ class CarlaGuiApp(QMainWindow):
                 # Populate map switcher
                 self._bridge.available_maps_signal.emit(self._carla.get_available_maps())
 
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _refresh_maps(self):
+        def _do():
+            maps = self._carla.get_available_maps()
+            if maps:
+                self._map_combo.clear()
+                self._map_combo.addItems(maps)
+                self._bridge.log_signal.emit(f"[OK] Found {len(maps)} maps.")
+            else:
+                self._bridge.log_signal.emit("[WARN] Connect first to list maps.")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _switch_map(self):
+        map_name = self._map_combo.currentText()
+        if not map_name:
+            self._append_log("[WARN] No map selected.")
+            return
+        def _do():
+            self._carla.load_world(map_name)
+            if self._carla.world:
+                self._route_planner = RoutePlanner(self._carla)
+                segments = self._route_planner.get_map_topology()
+                transforms = self._route_planner.get_spawn_points()
+                self._bridge.map_loaded_signal.emit(segments, transforms)
+                self._bridge.log_signal.emit(f"[OK] Switched to {map_name} — {len(transforms)} spawn points.")
         threading.Thread(target=_do, daemon=True).start()
 
     def _disconnect(self):
